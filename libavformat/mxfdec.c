@@ -172,6 +172,8 @@ typedef struct {
     MXFPartition *partitions;
     unsigned partitions_count;
     MXFOP op;
+    int run_in;
+    MXFPartition *current_partition;
     UID *packages_refs;
     int packages_count;
     MXFMetadataSet **metadata_sets;
@@ -459,7 +461,7 @@ static int mxf_read_partition_pack(void *arg, ByteIOContext *pb, int tag, int si
     if (!mxf->partitions)
         return AVERROR(ENOMEM);
 
-    partition = &mxf->partitions[mxf->partitions_count++];
+    partition = mxf->current_partition = &mxf->partitions[mxf->partitions_count++];
 
     switch(uid[13]) {
     case 2:
@@ -1316,10 +1318,98 @@ static int mxf_read_local_tags(MXFContext *mxf, KLVPacket *klv, MXFMetadataReadF
     return ctx_size ? mxf_add_metadata_set(mxf, ctx) : 0;
 }
 
+/**
+ * The purpose of this struct is to keep parsing cruft out of MXFContext
+ */
+typedef struct {
+    int parsing_backward;
+    int64_t last_forward_tell;
+} MXFParseState;
+
+/**
+ * Seeks to the previous partition, if possible
+ * @return <= 0 if we should stop parsing, > 0 if we should keep going
+ */
+static int mxf_seek_to_previous_partition(MXFContext *mxf, MXFParseState *parse)
+{
+    AVIOContext *pb = mxf->fc->pb;
+
+    if (!mxf->current_partition ||
+        mxf->run_in + mxf->current_partition->previous_partition <= parse->last_forward_tell)
+        return 0;   /* we've parsed all partitions */
+
+    /* seek to previous partition */
+    avio_seek(pb, mxf->run_in + mxf->current_partition->previous_partition, SEEK_SET);
+    mxf->current_partition = NULL;
+
+    av_dlog(mxf->fc, "seeking to previous partition\n");
+
+    return 1;
+}
+
+/**
+ * Called when essence is encountered
+ * @return <= 0 if we should stop parsing, > 0 if we should keep going
+ */
+static int mxf_parse_handle_essence(MXFContext *mxf, MXFParseState *parse)
+{
+    AVIOContext *pb = mxf->fc->pb;
+    int64_t ret;
+
+    if (!mxf->current_partition) {
+        av_log(mxf->fc, AV_LOG_ERROR, "found essence prior to PartitionPack\n");
+        return AVERROR_INVALIDDATA;
+    }
+
+    if (parse->parsing_backward) {
+        return mxf_seek_to_previous_partition(mxf, parse);
+    } else {
+        if (!mxf->footer_partition) {
+            av_dlog(mxf->fc, "no footer\n");
+            return 0;
+        }
+
+        av_dlog(mxf->fc, "seeking to footer\n");
+
+        /* remember where we were so we don't end up seeking further back than this */
+        parse->last_forward_tell = avio_tell(pb);
+
+        if (!pb->seekable) {
+            av_log(mxf->fc, AV_LOG_INFO, "file is not seekable - not parsing footer\n");
+            return -1;
+        }
+
+        /* seek to footer partition and parse backward */
+        if ((ret = avio_seek(pb, mxf->run_in + mxf->footer_partition, SEEK_SET)) < 0) {
+            av_log(mxf->fc, AV_LOG_ERROR, "failed to seek to footer @ 0x%"PRIx64" (%"PRId64") - partial file?\n",
+                   mxf->run_in + mxf->footer_partition, ret);
+            return ret;
+        }
+
+        mxf->current_partition = NULL;
+        parse->parsing_backward = 1;
+    }
+
+    return 1;
+}
+
+/**
+ * Called when the next partition or EOF is encountered
+ * @return <= 0 if we should stop parsing, > 0 if we should keep going
+ */
+static int mxf_parse_handle_partition_or_eof(MXFContext *mxf, MXFParseState *parse)
+{
+    return parse->parsing_backward ? mxf_seek_to_previous_partition(mxf, parse) : 1;
+}
+
 static int mxf_read_header(AVFormatContext *s, AVFormatParameters *ap)
 {
     MXFContext *mxf = s->priv_data;
     KLVPacket klv;
+    MXFParseState parse;
+
+    memset(&parse, 0, sizeof(parse));
+    parse.last_forward_tell = INT64_MAX;
 
     if (!mxf_read_sync(s->pb, mxf_header_partition_pack_key, 14)) {
         av_log(s, AV_LOG_ERROR, "could not find header partition pack key\n");
@@ -1327,11 +1417,19 @@ static int mxf_read_header(AVFormatContext *s, AVFormatParameters *ap)
     }
     avio_seek(s->pb, -14, SEEK_CUR);
     mxf->fc = s;
+    mxf->run_in = avio_tell(s->pb);
+
     while (!url_feof(s->pb)) {
         const MXFMetadataReadTableEntry *metadata;
 
-        if (klv_read_packet(&klv, s->pb) < 0)
-            break;
+        if (klv_read_packet(&klv, s->pb) < 0) {
+            /* EOF - seek to previous partition or stop */
+            if(mxf_parse_handle_partition_or_eof(mxf, &parse) <= 0)
+                break;
+            else
+                continue;
+        }
+
         PRINT_KEY(s, "read header", klv.key);
         av_dlog(s, "size %"PRIu64" offset %#"PRIx64"\n", klv.length, klv.offset);
         if (IS_KLV_KEY(klv.key, mxf_encrypted_triplet_key) ||
@@ -1346,8 +1444,16 @@ static int mxf_read_header(AVFormatContext *s, AVFormatParameters *ap)
                 mxf->first_essence_kl_length = avio_tell(s->pb) - klv.offset;
                 mxf->first_essence_length = klv.length;
             }
-            avio_skip(s->pb, klv.length);
+
+            /* seek to footer, previous partition or stop */
+            if (mxf_parse_handle_essence(mxf, &parse) <= 0)
+                break;
             continue;
+        } else if (!memcmp(klv.key, mxf_header_partition_pack_key, 13) &&
+                   klv.key[13] >= 2 && klv.key[13] <= 4 && mxf->current_partition) {
+            /* next partition pack - keep going, seek to previous partition or stop */
+            if(mxf_parse_handle_partition_or_eof(mxf, &parse) <= 0)
+                break;
         }
 
         for (metadata = mxf_metadata_read_table; metadata->read; metadata++) {
