@@ -113,6 +113,7 @@ typedef struct {
     int track_id;
     uint8_t track_number[4];
     AVRational edit_rate;
+    int current_sample_index;
 } MXFTrack;
 
 typedef struct {
@@ -364,8 +365,24 @@ static int mxf_decrypt_triplet(AVFormatContext *s, AVPacket *pkt, KLVPacket *klv
 static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
 {
     KLVPacket klv;
+    MXFContext* mxf = s->priv_data;
+    MXFTrack *tr;
+    int index;
 
     while (!url_feof(s->pb)) {
+        if (mxf->current_klv_data.length) {
+            klv = mxf->current_klv_data;
+            index = mxf->current_klv_index;
+            tr = s->streams[index]->priv_data;
+            klv.length = FFMIN(s->streams[index]->index_entries[tr->current_sample_index].size,
+                               mxf->current_klv_data.length);
+            mxf->current_klv_data.offset += klv.length;
+            mxf->current_klv_data.length -= klv.length;
+            av_dlog(s, "Clip-wrapped reading. klv.length=%"PRId64" current_sample_index=%d\n",
+                    klv.length, tr->current_sample_index);
+
+            goto read_data;
+        }
         if (klv_read_packet(&klv, s->pb) < 0)
             return -1;
         PRINT_KEY(s, "read packet", klv.key);
@@ -379,13 +396,22 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
             return 0;
         }
         if (IS_KLV_KEY(klv.key, mxf_essence_element_key)) {
-            int index = mxf_get_stream_index(s, &klv);
+            index = mxf_get_stream_index(s, &klv);
+            tr = s->streams[index]->priv_data;
             if (index < 0) {
                 av_log(s, AV_LOG_ERROR, "error getting stream index %d\n", AV_RB32(klv.key+12));
                 goto skip;
             }
             if (s->streams[index]->discard == AVDISCARD_ALL)
                 goto skip;
+            if (tr->current_sample_index < s->streams[index]->nb_index_entries &&
+                klv.length > s->streams[index]->index_entries[tr->current_sample_index].size &&
+                s->streams[index]->index_entries[tr->current_sample_index].size) {
+                mxf->current_klv_data = klv;
+                mxf->current_klv_index = index;
+                return mxf_read_packet(s, pkt);
+            }
+        read_data:
             /* check for 8 channels AES3 element */
             if (klv.key[12] == 0x06 && klv.key[13] == 0x01 && klv.key[14] == 0x10) {
                 if (mxf_get_d10_aes3_packet(s->pb, s->streams[index], pkt, klv.length) < 0) {
@@ -399,6 +425,7 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
             }
             pkt->stream_index = index;
             pkt->pos = klv.offset;
+            tr->current_sample_index++;
             return 0;
         } else
         skip:
@@ -1215,10 +1242,6 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
                 st->need_parsing = AVSTREAM_PARSE_FULL;
             }
         }
-        if (st->codec->codec_type != AVMEDIA_TYPE_DATA && (*essence_container_ul)[15] > 0x01) {
-            av_log(mxf->fc, AV_LOG_WARNING, "only frame wrapped mappings are correctly supported\n");
-            st->need_parsing = AVSTREAM_PARSE_FULL;
-        }
 
         if ((ret = mxf_parse_index(mxf, i, st)))
             return ret;
@@ -1317,13 +1340,19 @@ static int mxf_read_header(AVFormatContext *s, AVFormatParameters *ap)
         PRINT_KEY(s, "read header", klv.key);
         av_dlog(s, "size %"PRIu64" offset %#"PRIx64"\n", klv.length, klv.offset);
         if (IS_KLV_KEY(klv.key, mxf_encrypted_triplet_key) ||
-            IS_KLV_KEY(klv.key, mxf_essence_element_key)) {
-            /* FIXME avoid seek */
-            avio_seek(s->pb, klv.offset, SEEK_SET);
-            break;
-        }
+            IS_KLV_KEY(klv.key, mxf_essence_element_key) ||
+            IS_KLV_KEY(klv.key, mxf_system_item_key)) {
         if (IS_KLV_KEY(klv.key, mxf_system_item_key)) {
             mxf->system_item = 1;
+        }
+
+            if (!mxf->essence_offset)
+                mxf->essence_offset = klv.offset;
+
+            if (!mxf->first_essence_kl_length && IS_KLV_KEY(klv.key, mxf_essence_element_key)) {
+                mxf->first_essence_kl_length = avio_tell(s->pb) - klv.offset;
+                mxf->first_essence_length = klv.length;
+            }
             avio_skip(s->pb, klv.length);
             continue;
         }
@@ -1348,6 +1377,12 @@ static int mxf_read_header(AVFormatContext *s, AVFormatParameters *ap)
         if (!metadata->read)
             avio_skip(s->pb, klv.length);
     }
+    /* FIXME avoid seek */
+    if (!mxf->essence_offset)  {
+        av_log(s, AV_LOG_ERROR, "no essence\n");
+        return AVERROR_INVALIDDATA;
+    }
+    avio_seek(s->pb, mxf->essence_offset, SEEK_SET);
     return mxf_parse_structural_metadata(mxf);
 }
 
@@ -1412,21 +1447,57 @@ static int mxf_probe(AVProbeData *p) {
     return 0;
 }
 
-/* rudimentary byte seek */
-/* XXX: use MXF Index */
 static int mxf_read_seek(AVFormatContext *s, int stream_index, int64_t sample_time, int flags)
 {
     AVStream *st = s->streams[stream_index];
-    int64_t seconds;
+    MXFContext* mxf = s->priv_data;
+    MXFTrack *tr = st->priv_data;
+    int64_t seekpos;
 
-    if (!s->bit_rate)
-        return -1;
-    if (sample_time < 0)
-        sample_time = 0;
-    seconds = av_rescale(sample_time, st->time_base.num, st->time_base.den);
-    if (avio_seek(s->pb, (s->bit_rate * seconds) >> 3, SEEK_SET) < 0)
-        return -1;
-    ff_update_cur_dts(s, st, sample_time);
+    if (!tr->current_sample_index) {
+        AVPacket pkt;
+        mxf_read_packet(s, &pkt);
+        av_free_packet(&pkt);
+    }
+
+    if (st->nb_index_entries) {
+        int index = av_index_search_timestamp(st, sample_time, flags);
+        av_dlog(s, "stream %d, timestamp %"PRId64", sample %d\n", st->index, sample_time, index);
+        if (index < 0 && sample_time < st->index_entries[0].timestamp)
+            index = 0;
+        if (index < 0)
+            return -1;
+        seekpos = st->index_entries[index].pos;
+        av_update_cur_dts(s, st, st->index_entries[index].timestamp);
+        tr->current_sample_index = index;
+        if (!index) {
+            mxf->current_klv_data.length = 0;
+            mxf->current_klv_index = 0;
+        }
+    } else {
+        int64_t seconds;
+        if (!s->bit_rate)
+            return -1;
+        if (sample_time < 0)
+            sample_time = 0;
+        seconds = av_rescale(sample_time, st->time_base.num, st->time_base.den);
+        seekpos = (s->bit_rate * seconds) >> 3;
+        av_update_cur_dts(s, st, sample_time);
+    }
+
+    if (mxf->current_klv_data.length) {
+        if (mxf->current_klv_index == stream_index) {
+            int64_t seekoffset = seekpos - avio_tell(s->pb);
+            mxf->current_klv_data.offset += seekoffset;
+            if (seekoffset < (int64_t)mxf->current_klv_data.length)
+                mxf->current_klv_data.length -= seekoffset;
+            else
+                mxf->current_klv_data.length = 0;
+        }
+    }
+
+    avio_seek(s->pb, seekpos, SEEK_SET);
+
     return 0;
 }
 
