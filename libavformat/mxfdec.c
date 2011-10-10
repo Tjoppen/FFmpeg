@@ -188,6 +188,7 @@ typedef struct {
     int64_t first_essence_length;
     KLVPacket current_klv_data;
     int current_klv_index;
+    int single_eubc;
 } MXFContext;
 
 enum MXFWrappingScheme {
@@ -374,8 +375,15 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
             klv = mxf->current_klv_data;
             index = mxf->current_klv_index;
             tr = s->streams[index]->priv_data;
-            klv.length = FFMIN(s->streams[index]->index_entries[tr->current_sample_index].size,
-                               mxf->current_klv_data.length);
+            if (mxf->single_eubc) {
+                klv.length = mxf->single_eubc;
+                if (klv.length < 32)
+                    klv.length *= 1920;
+            } else
+                klv.length = s->streams[index]->index_entries[tr->current_sample_index].size;
+
+            klv.length = FFMIN(klv.length, mxf->current_klv_data.length);
+
             mxf->current_klv_data.offset += klv.length;
             mxf->current_klv_data.length -= klv.length;
             av_dlog(s, "Clip-wrapped reading. klv.length=%"PRId64" current_sample_index=%d\n",
@@ -404,9 +412,9 @@ static int mxf_read_packet(AVFormatContext *s, AVPacket *pkt)
             }
             if (s->streams[index]->discard == AVDISCARD_ALL)
                 goto skip;
-            if (tr->current_sample_index < s->streams[index]->nb_index_entries &&
+            if ((tr->current_sample_index < s->streams[index]->nb_index_entries &&
                 klv.length > s->streams[index]->index_entries[tr->current_sample_index].size &&
-                s->streams[index]->index_entries[tr->current_sample_index].size) {
+                s->streams[index]->index_entries[tr->current_sample_index].size) || mxf->single_eubc) {
                 mxf->current_klv_data = klv;
                 mxf->current_klv_index = index;
                 return mxf_read_packet(s, pkt);
@@ -972,6 +980,13 @@ static int mxf_parse_index(MXFContext *mxf, int i, AVStream *st)
     if ((ret = mxf_get_sorted_table_segments(mxf, &nb_sorted_segments, &sorted_segments)))
         return ret;
 
+    if (nb_sorted_segments == 1 && !sorted_segments[0]->index_duration &&
+        sorted_segments[0]->edit_unit_byte_count > 0) {
+        mxf->single_eubc = sorted_segments[0]->edit_unit_byte_count;
+        av_free(sorted_segments);
+        return 0;
+    }
+
     for (j = 0; j < nb_sorted_segments; j++) {
         int n_delta = i;
         int duration, sample_duration = 1, last_sample_size = 0;
@@ -1469,6 +1484,16 @@ static int mxf_read_seek(AVFormatContext *s, int stream_index, int64_t sample_ti
         av_update_cur_dts(s, st, st->index_entries[index].timestamp);
         tr->current_sample_index = index;
         if (!index) {
+            mxf->current_klv_data.length = 0;
+            mxf->current_klv_index = 0;
+        }
+    } else if (mxf->single_eubc) {
+        seekpos = mxf->single_eubc * sample_time + mxf->essence_offset;
+        if (sample_time > 0 && seekpos)
+            seekpos += mxf->first_essence_kl_length;
+        av_update_cur_dts(s, st, sample_time);
+        tr->current_sample_index = sample_time;
+        if (!sample_time) {
             mxf->current_klv_data.length = 0;
             mxf->current_klv_index = 0;
         }
