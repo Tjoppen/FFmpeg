@@ -1099,20 +1099,16 @@ static int64_t mxf_essence_container_length(MXFContext *mxf, int body_sid)
     return ret;
 }
 
-static int mxf_parse_index(MXFContext *mxf, int track_id, AVStream *st)
+static int mxf_parse_index(MXFContext *mxf, int track_id, AVStream *st, MXFIndexTableSegment **sorted_segments, int nb_sorted_segments)
 {
     int64_t accumulated_offset = 0;
-    int j, k, l, ret, nb_sorted_segments;
-    MXFIndexTableSegment **sorted_segments;
+    int j, k, l, ret;
     int n_delta = track_id - 1;  /* TrackID = 1-based stream index */
 
     if (track_id < 1) {
         av_log(mxf->fc, AV_LOG_ERROR, "TrackID not positive: %i\n", track_id);
         return AVERROR_INVALIDDATA;
     }
-
-    if ((ret = mxf_get_sorted_table_segments(mxf, &nb_sorted_segments, &sorted_segments)))
-        return ret;
 
     for (j = 0; j < nb_sorted_segments; j++) {
         int duration, sample_duration = 1, last_sample_size = 0;
@@ -1220,8 +1216,6 @@ static int mxf_parse_index(MXFContext *mxf, int track_id, AVStream *st)
         accumulated_offset += segment_size;
     }
 
-    av_free(sorted_segments);
-
     return 0;
 }
 
@@ -1229,7 +1223,8 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
 {
     MXFPackage *material_package = NULL;
     MXFPackage *temp_package = NULL;
-    int i, j, k, ret;
+    int i, j, k, ret, nb_sorted_segments;
+    MXFIndexTableSegment **sorted_segments;
 
     av_dlog(mxf->fc, "metadata sets count %d\n", mxf->metadata_sets_count);
     /* TODO: handle multiple material packages (OP3x) */
@@ -1241,6 +1236,9 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
         av_log(mxf->fc, AV_LOG_ERROR, "no material package found\n");
         return -1;
     }
+
+    if ((ret = mxf_get_sorted_table_segments(mxf, &nb_sorted_segments, &sorted_segments)))
+        return ret;
 
     for (i = 0; i < material_package->tracks_count; i++) {
         MXFPackage *source_package = NULL;
@@ -1287,7 +1285,8 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
             for (k = 0; k < source_package->tracks_count; k++) {
                 if (!(temp_track = mxf_resolve_strong_ref(mxf, &source_package->tracks_refs[k], Track))) {
                     av_log(mxf->fc, AV_LOG_ERROR, "could not resolve source track strong ref\n");
-                    return -1;
+                    ret = -1;
+                    goto fail_and_free;
                 }
                 if (temp_track->track_id == component->source_track_id) {
                     source_track = temp_track;
@@ -1304,7 +1303,8 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
 
         if (!(source_track->sequence = mxf_resolve_strong_ref(mxf, &source_track->sequence_ref, Sequence))) {
             av_log(mxf->fc, AV_LOG_ERROR, "could not resolve source track sequence strong ref\n");
-            return -1;
+            ret = -1;
+            goto fail_and_free;
         }
 
         /* 0001GL00.MXF.A1.mxf_opatom.mxf has the same SourcePackageID as 0001GL.MXF.V1.mxf_opatom.mxf
@@ -1317,7 +1317,8 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
         st = avformat_new_stream(mxf->fc, NULL);
         if (!st) {
             av_log(mxf->fc, AV_LOG_ERROR, "could not allocate stream\n");
-            return -1;
+            ret = AVERROR(ENOMEM);
+            goto fail_and_free;
         }
         st->id = source_track->track_id;
         st->priv_data = source_track;
@@ -1416,10 +1417,15 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
             st->need_parsing = AVSTREAM_PARSE_TIMESTAMPS;
         }
 
-        if ((ret = mxf_parse_index(mxf, material_track->track_id, st)))
-            return ret;
+        if ((ret = mxf_parse_index(mxf, material_track->track_id, st, sorted_segments, nb_sorted_segments)))
+            goto fail_and_free;
     }
-    return 0;
+ 
+    ret = 0;
+
+fail_and_free:
+    av_free(sorted_segments);
+    return ret;
 }
 
 static const MXFMetadataReadTableEntry mxf_metadata_read_table[] = {
