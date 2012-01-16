@@ -401,6 +401,7 @@ void avcodec_register_all(void)
     REGISTER_DECODER (BINTEXT, bintext);
     REGISTER_DECODER  (XBIN, xbin);
     REGISTER_DECODER  (IDF, idf);
+    REGISTER_DECODER  (S436M, s436m);
 
     /* parsers */
     REGISTER_PARSER  (AAC, aac);
