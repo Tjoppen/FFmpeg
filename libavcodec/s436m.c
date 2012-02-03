@@ -27,7 +27,7 @@
 AVCodec s436m_decoder =
 {
     .name           = "s436m",
-    .type           = AVMEDIA_TYPE_VIDEO,
+    .type           = AVMEDIA_TYPE_SUBTITLE,
     .id             = CODEC_ID_S436M,
     .priv_data_size = sizeof(S436MContext),
     .init           = s436m_decode_init,
