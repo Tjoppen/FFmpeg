@@ -373,7 +373,6 @@ void avcodec_register_all(void)
     REGISTER_DECODER (PGSSUB, pgssub);
     REGISTER_ENCDEC  (SRT, srt);
     REGISTER_ENCDEC  (XSUB, xsub);
-    REGISTER_DECODER (S436M, s436m);
 
     /* external libraries */
     REGISTER_ENCODER (LIBAACPLUS, libaacplus);
@@ -402,6 +401,9 @@ void avcodec_register_all(void)
     REGISTER_DECODER (BINTEXT, bintext);
     REGISTER_DECODER  (XBIN, xbin);
     REGISTER_DECODER  (IDF, idf);
+
+    /* data */
+    REGISTER_DECODER (S436M, s436m);
 
     /* parsers */
     REGISTER_PARSER  (AAC, aac);
