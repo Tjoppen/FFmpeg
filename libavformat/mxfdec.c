@@ -929,6 +929,10 @@ static int mxf_parse_structural_metadata(MXFContext *mxf)
             } else if (st->codec->codec_id == CODEC_ID_MP2) {
                 st->need_parsing = AVSTREAM_PARSE_FULL;
             }
+        } else if (st->codec->codec_type == AVMEDIA_TYPE_DATA) {
+        	container_ul = mxf_get_codec_ul(mxf_essence_container_uls, essence_container_ul);
+        	if (st->codec->codec_id == CODEC_ID_NONE)
+                st->codec->codec_id = container_ul->id;
         }
         if (st->codec->codec_type != AVMEDIA_TYPE_DATA && (*essence_container_ul)[15] > 0x01) {
             av_log(mxf->fc, AV_LOG_WARNING, "only frame wrapped mappings are correctly supported\n");
