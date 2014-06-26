@@ -366,6 +366,7 @@ enum CodecID {
     CODEC_ID_BINTEXT,
     CODEC_ID_XBIN,
     CODEC_ID_IDF,
+    CODEC_ID_S436M,
 
     CODEC_ID_PROBE= 0x19000, ///< codec_id is not known (like CODEC_ID_NONE) but lavf should attempt to identify it
 
